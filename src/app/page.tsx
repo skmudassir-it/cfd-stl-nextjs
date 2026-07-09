@@ -5,29 +5,19 @@ import { useSolverWorker } from "@/lib/useSolverWorker";
 import { generateMask, type ShapeKind } from "@/lib/shapes";
 import type { SolverFrame } from "@/lib/solver";
 
-// ── magma colormap (bright, high-contrast) ──────────────────
-// Dark background → bright yellow/white at high values
-function magma(t: number): [number, number, number] {
+// ── Blue–White–Red diverging colormap (classic CFD) ────────
+// t=0 → blue, t=0.5 → white, t=1 → red
+function coolwarm(t: number): [number, number, number] {
   t = Math.max(0, Math.min(1, t));
-  // piecewise cubic approximation of matplotlib magma
-  const r = t < 0.5
-    ? 0.001462 + t * 2 * (0.733068 - 0.001462)
-    : 0.733068 + (t - 0.5) * 2 * (0.987053 - 0.733068);
-  const g = t < 0.25
-    ? 0.000466 + t * 4 * (0.327754 - 0.000466)
-    : t < 0.5
-      ? 0.327754 + (t - 0.25) * 4 * (0.561235 - 0.327754)
-      : t < 0.75
-        ? 0.561235 + (t - 0.5) * 4 * (0.849142 - 0.561235)
-        : 0.849142 + (t - 0.75) * 4 * (0.995737 - 0.849142);
-  const b = t < 0.25
-    ? 0.013866 + t * 4 * (0.174267 - 0.013866)
-    : t < 0.5
-      ? 0.174267 + (t - 0.25) * 4 * (0.350492 - 0.174267)
-      : t < 0.75
-        ? 0.350492 + (t - 0.5) * 4 * (0.527159 - 0.350492)
-        : 0.527159 + (t - 0.75) * 4 * (0.247276 - 0.527159);
-  return [r, g, b];
+  if (t < 0.5) {
+    // blue → white: lerp (0,0,1) → (1,1,1)
+    const s = t * 2; // 0..1
+    return [s, s, 1 - s * 0.7];
+  } else {
+    // white → red: lerp (1,1,1) → (1,0,0)
+    const s = (t - 0.5) * 2; // 0..1
+    return [1, 1 - s, 1 - s];
+  }
 }
 
 // ── render frame to canvas ────────────────────────────────────
@@ -55,11 +45,11 @@ function renderFrame(
       const k = Math.min(gj * nx + gi, data.length - 1);
       const i4 = (py * w + px) * 4;
       if (solidMask[k]) {
-        // visible light gray obstacle with subtle edge
-        img.data[i4] = 200; img.data[i4+1] = 195; img.data[i4+2] = 210; img.data[i4+3] = 255;
+        // dark obstacle on white background
+        img.data[i4] = 40; img.data[i4+1] = 40; img.data[i4+2] = 40; img.data[i4+3] = 255;
       } else {
         const t = isFinite(data[k]) ? (data[k] - vMin) / vRange : 0.5;
-        const [cr, cg, cb] = magma(t);
+        const [cr, cg, cb] = coolwarm(t);
         img.data[i4] = Math.floor(cr * 255);
         img.data[i4+1] = Math.floor(cg * 255);
         img.data[i4+2] = Math.floor(cb * 255);
@@ -172,29 +162,29 @@ export default function Home() {
   const cancelExport = useCallback(() => { mediaRecorderRef.current?.stop(); }, []);
 
   return (
-    <div className="min-h-screen bg-zinc-950 text-zinc-200 flex flex-col">
+    <div className="min-h-screen bg-white text-gray-800 flex flex-col">
       {/* header */}
-      <header className="px-6 py-3 border-b border-zinc-800 flex items-center justify-between shrink-0">
+      <header className="px-6 py-3 border-b border-gray-200 flex items-center justify-between shrink-0">
         <div>
-          <h1 className="text-base font-bold text-violet-400">🌊 Flow Past Obstacles</h1>
-          <p className="text-[11px] text-zinc-500">Navier-Stokes · Chorin projection · In-browser CFD</p>
+          <h1 className="text-base font-bold text-violet-600">🌊 Flow Past Obstacles</h1>
+          <p className="text-[11px] text-gray-400">Navier-Stokes · Chorin projection · In-browser CFD</p>
         </div>
-        <span className="text-xs text-zinc-600 font-mono">Re = {reynolds} · {shape} · size={shapeSize.toFixed(2)}</span>
+        <span className="text-xs text-gray-400 font-mono">Re = {reynolds} · {shape} · size={shapeSize.toFixed(2)}</span>
       </header>
 
       <div className="flex-1 flex">
         {/* canvas */}
-        <div className="flex-1 p-3 flex items-center justify-center bg-[#0a0a0f]">
+        <div className="flex-1 p-3 flex items-center justify-center bg-gray-50">
           <canvas ref={canvasRef} width={900} height={450}
-            className="w-full max-w-[900px] rounded-lg border border-zinc-800" />
+            className="w-full max-w-[900px] rounded-lg border border-gray-200 bg-white shadow-sm" />
         </div>
 
         {/* controls */}
-        <div className="w-[340px] min-w-[340px] bg-zinc-900 border-l border-zinc-800 p-4 flex flex-col gap-4 overflow-y-auto text-sm">
+        <div className="w-[340px] min-w-[340px] bg-gray-50 border-l border-gray-200 p-4 flex flex-col gap-4 overflow-y-auto text-sm">
 
           {/* Shape selector */}
           <div>
-            <label className="font-semibold text-zinc-300">Obstacle Shape</label>
+            <label className="font-semibold text-gray-700">Obstacle Shape</label>
             <div className="grid grid-cols-5 gap-1.5 mt-2">
               {SHAPES.map(s => (
                 <button key={s.kind}
@@ -203,7 +193,7 @@ export default function Home() {
                   className={`py-2 rounded-lg text-sm font-medium transition-all ${
                     shape === s.kind
                       ? "bg-violet-600 text-white"
-                      : "bg-zinc-800 text-zinc-400 hover:bg-zinc-700"
+                      : "bg-white text-gray-500 hover:bg-gray-100 border border-gray-200"
                   }`}
                   title={s.label}
                 >
@@ -211,17 +201,17 @@ export default function Home() {
                 </button>
               ))}
             </div>
-            <p className="text-[11px] text-zinc-500 mt-1 capitalize">{shape}</p>
+            <p className="text-[11px] text-gray-400 mt-1 capitalize">{shape}</p>
           </div>
 
           {/* Size */}
           <div>
-            <label className="font-semibold text-zinc-300">Size: {shapeSize.toFixed(2)}</label>
+            <label className="font-semibold text-gray-700">Size: {shapeSize.toFixed(2)}</label>
             <input type="range" min={0.05} max={1.0} step={0.01} value={shapeSize}
               onChange={e => setShapeSize(Number(e.target.value))}
               disabled={running}
               className="w-full mt-1 accent-violet-500" />
-            <div className="flex justify-between text-[10px] text-zinc-600">
+            <div className="flex justify-between text-[10px] text-gray-400">
               <span>0.05</span><span>1.0</span>
             </div>
           </div>
@@ -229,7 +219,7 @@ export default function Home() {
           {/* Aspect ratio (only for non-circle) */}
           {shape !== "circle" && (
             <div>
-              <label className="font-semibold text-zinc-300">Aspect (W/H): {shapeAspect.toFixed(1)}</label>
+              <label className="font-semibold text-gray-700">Aspect (W/H): {shapeAspect.toFixed(1)}</label>
               <input type="range" min={0.3} max={3.0} step={0.1} value={shapeAspect}
                 onChange={e => setShapeAspect(Number(e.target.value))}
                 disabled={running}
@@ -239,7 +229,7 @@ export default function Home() {
 
           {/* X position */}
           <div>
-            <label className="font-semibold text-zinc-300">Position X: {shapeX.toFixed(2)}</label>
+            <label className="font-semibold text-gray-700">Position X: {shapeX.toFixed(2)}</label>
             <input type="range" min={0.3} max={3.0} step={0.05} value={shapeX}
               onChange={e => setShapeX(Number(e.target.value))}
               disabled={running}
@@ -248,12 +238,12 @@ export default function Home() {
 
           {/* Reynolds */}
           <div>
-            <label className="font-semibold text-zinc-300">Reynolds: {reynolds}</label>
+            <label className="font-semibold text-gray-700">Reynolds: {reynolds}</label>
             <input type="range" min={5} max={500} step={5} value={reynolds}
               onChange={e => setReynolds(Number(e.target.value))}
               disabled={running}
               className="w-full mt-1 accent-violet-500" />
-            <div className="flex justify-between text-[10px] text-zinc-600">
+            <div className="flex justify-between text-[10px] text-gray-400">
               <span>Laminar</span><span>Transition</span><span>Turbulent</span>
             </div>
           </div>
@@ -263,7 +253,7 @@ export default function Home() {
             {(["vorticity", "speed"] as const).map(f => (
               <button key={f} onClick={() => setField(f)} disabled={running}
                 className={`flex-1 py-1.5 rounded-lg text-xs font-semibold transition-all ${
-                  field === f ? "bg-violet-600 text-white" : "bg-zinc-800 text-zinc-400 hover:bg-zinc-700"
+                  field === f ? "bg-violet-600 text-white" : "bg-white text-gray-500 hover:bg-gray-100 border border-gray-200"
                 }`}>
                 {f === "vorticity" ? "🌀 Vorticity" : "💨 Speed"}
               </button>
@@ -273,7 +263,7 @@ export default function Home() {
           {/* Run */}
           <button onClick={running ? cancel : handleRun}
             className={`w-full py-2.5 rounded-lg text-sm font-bold transition-all ${
-              running ? "bg-red-600 hover:bg-red-500 text-white"
+              running ? "bg-red-500 hover:bg-red-400 text-white"
                       : "bg-violet-600 hover:bg-violet-500 text-white shadow-lg shadow-violet-600/20"
             }`}>
             {running ? "⏹ Cancel" : "▶ Run Simulation"}
@@ -282,43 +272,43 @@ export default function Home() {
           {/* progress */}
           {running && (
             <div>
-              <div className="w-full h-2 bg-zinc-800 rounded-full overflow-hidden">
+              <div className="w-full h-2 bg-gray-200 rounded-full overflow-hidden">
                 <div className="h-full bg-violet-500 transition-all duration-300" style={{ width: `${progress}%` }} />
               </div>
-              <p className="text-xs text-violet-400 text-center mt-1">Computing... {progress}%</p>
+              <p className="text-xs text-violet-600 text-center mt-1">Computing... {progress}%</p>
             </div>
           )}
-          {error && <p className="text-red-400 text-xs bg-red-900/20 p-2 rounded-lg">{error}</p>}
+          {error && <p className="text-red-600 text-xs bg-red-50 p-2 rounded-lg border border-red-200">{error}</p>}
 
           {/* playback */}
           {frames.length > 0 && !running && (
             <>
-              <div className="border-t border-zinc-800 pt-3">
+              <div className="border-t border-gray-200 pt-3">
                 <div className="flex gap-2">
                   <button onClick={() => setPlaying(p => !p)}
-                    className="flex-1 py-1.5 rounded-lg text-xs bg-zinc-800 hover:bg-zinc-700 text-zinc-300">
+                    className="flex-1 py-1.5 rounded-lg text-xs bg-white hover:bg-gray-100 text-gray-700 border border-gray-200">
                     {playing ? "⏸ Pause" : "▶ Play"}
                   </button>
                   <button onClick={() => { setPlaying(false); setFrameIdx(0); }}
-                    className="py-1.5 px-3 rounded-lg text-xs bg-zinc-800 hover:bg-zinc-700 text-zinc-300">⏮</button>
+                    className="py-1.5 px-3 rounded-lg text-xs bg-white hover:bg-gray-100 text-gray-700 border border-gray-200">⏮</button>
                 </div>
                 <input type="range" min={0} max={frames.length - 1} value={frameIdx}
                   onChange={e => { setPlaying(false); setFrameIdx(Number(e.target.value)); }}
                   className="w-full mt-1 accent-violet-500" />
-                <p className="text-[10px] text-zinc-500 text-center">Frame {frameIdx + 1} / {frames.length}</p>
+                <p className="text-[10px] text-gray-400 text-center">Frame {frameIdx + 1} / {frames.length}</p>
               </div>
               <button onClick={recording ? cancelExport : startExport}
                 className={`w-full py-2.5 rounded-lg text-sm font-bold ${
-                  recording ? "bg-amber-600 text-white" : "bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border border-zinc-700"
+                  recording ? "bg-amber-500 text-white" : "bg-white hover:bg-gray-100 text-gray-700 border border-gray-200"
                 }`}>
                 {recording ? "⏹ Cancel" : "⬇ Export WebM"}
               </button>
-              {recording && <p className="text-xs text-amber-400 text-center">Recording...</p>}
+              {recording && <p className="text-xs text-amber-600 text-center">Recording...</p>}
             </>
           )}
 
           {/* info */}
-          <div className="border-t border-zinc-800 pt-3 text-[10px] text-zinc-600 space-y-0.5">
+          <div className="border-t border-gray-200 pt-3 text-[10px] text-gray-400 space-y-0.5">
             <p>Grid: {NX}×{NY} · Domain: {LX}×{LY}</p>
             <p>Method: Chorin · Jacobi PP · ν=U·D/Re</p>
             <p>Δt: auto (CFL + diffusive limit)</p>
