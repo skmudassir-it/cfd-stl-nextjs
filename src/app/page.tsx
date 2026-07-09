@@ -1,32 +1,28 @@
 "use client";
 
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Separator } from "@/components/ui/separator";
 import { Progress } from "@/components/ui/progress";
+import { Play, Loader2 } from "lucide-react";
 import * as THREE from "three";
 
 import FileUpload from "@/components/FileUpload";
 import StlViewer from "@/components/StlViewer";
 import SliceControls from "@/components/SliceControls";
 import CfdConfig from "@/components/CfdConfig";
-import ResultsView from "@/components/ResultsView";
+import CfdResults from "@/components/CfdResults";
 
-import { uploadStl, sliceMesh, runSimulation } from "@/lib/api";
-import type {
-  StlBounds,
-  SliceResult,
-  CfdResult,
-  PlaneAxis,
-  FlowDirection,
-  AppStep,
-} from "@/lib/types";
+import { sliceGeometry } from "@/lib/stl-slicer";
+import { useCfdWorker } from "@/lib/useCfdWorker";
+import type { SliceResult, PlaneAxis, FlowDirection, AppStep } from "@/lib/types";
 
 export default function Home() {
   const [step, setStep] = useState<AppStep>("upload");
   const [stlUrl, setStlUrl] = useState<string | null>(null);
-  const [sessionId, setSessionId] = useState<string | null>(null);
-  const [bounds, setBounds] = useState<StlBounds | null>(null);
+  const [geometry, setGeometry] = useState<THREE.BufferGeometry | null>(null);
+  const [modelBounds, setModelBounds] = useState<{ min: THREE.Vector3; max: THREE.Vector3 } | null>(null);
+  const [resultFrames, setResultFrames] = useState<typeof frames>([]);
 
   // slice state
   const [axis, setAxis] = useState<PlaneAxis>("z");
@@ -35,70 +31,78 @@ export default function Home() {
   const [sliceLoading, setSliceLoading] = useState(false);
 
   // cfd state
-  const [cfdResult, setCfdResult] = useState<CfdResult | null>(null);
-  const [cfdRunning, setCfdRunning] = useState(false);
-  const [cfdError, setCfdError] = useState<string | null>(null);
+  const { frames, running: cfdRunning, progress, error: cfdError, run, cancel } = useCfdWorker();
+  const [cfdDomain, setCfdDomain] = useState<[number, number, number, number]>([0, 1, 0, 1]);
 
   const sliceTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // ── upload handler ──────────────────────────────────────────
   const handleUpload = useCallback(async (file: File) => {
-    const result = await uploadStl(file);
-    setSessionId(result.session_id);
-    setBounds(result);
     setStlUrl(URL.createObjectURL(file));
-    setStep("slice");
-
-    // auto-slice at center
-    const mid = (result.bounds[0][2] + result.bounds[1][2]) / 2;
-    setPosition(mid);
-    const slice = await sliceMesh(result.session_id, "z", mid);
-    setSliceResult(slice);
+    // geometry + bounds come via callbacks from StlViewer
   }, []);
 
-  // ── slice handler ───────────────────────────────────────────
-  const handleSlice = useCallback(
-    async (newAxis: PlaneAxis, newPos: number) => {
-      if (!sessionId) return;
+  const handleBoundsReady = useCallback((box: THREE.Box3) => {
+    setModelBounds({ min: box.min, max: box.max });
+    setStep("slice");
+    // auto-slice at z-center
+    const midZ = (box.min.z + box.max.z) / 2;
+    setPosition(midZ);
+  }, []);
+
+  const handleGeometryReady = useCallback((geo: THREE.BufferGeometry) => {
+    setGeometry(geo);
+  }, []);
+
+  // ── slice handler (client-side, no API) ─────────────────────
+  const doSlice = useCallback(
+    (a: PlaneAxis, pos: number) => {
+      if (!geometry) return;
       setSliceLoading(true);
       try {
-        const result = await sliceMesh(sessionId, newAxis, newPos);
-        setSliceResult(result);
+        const result = sliceGeometry(geometry, a, pos);
+        setSliceResult({
+          axis: result.axis,
+          position: result.position,
+          polygons: result.polygons,
+          num_polygons: result.polygons.length,
+          bounds_range: [0, 0], // not used
+        });
       } catch {
-        // silently fail — user can retry
+        // silently fail
       } finally {
         setSliceLoading(false);
       }
     },
-    [sessionId]
+    [geometry]
   );
 
   const handleAxisChange = useCallback(
     (a: PlaneAxis) => {
       setAxis(a);
-      const idx = { x: 0, y: 1, z: 2 }[a];
-      if (bounds) {
-        const mid = (bounds.bounds[0][idx] + bounds.bounds[1][idx]) / 2;
+      if (modelBounds) {
+        const idx = { x: 0, y: 1, z: 2 };
+        const ax = a as "x" | "y" | "z";
+        const mid = (modelBounds.min.getComponent(idx[ax]) + modelBounds.max.getComponent(idx[ax])) / 2;
         setPosition(mid);
-        handleSlice(a, mid);
+        doSlice(a, mid);
       }
     },
-    [bounds, handleSlice]
+    [modelBounds, doSlice]
   );
 
   const handlePositionChange = useCallback(
     (p: number) => {
       setPosition(p);
-      // debounce slice requests
       if (sliceTimeoutRef.current) clearTimeout(sliceTimeoutRef.current);
-      sliceTimeoutRef.current = setTimeout(() => handleSlice(axis, p), 100);
+      sliceTimeoutRef.current = setTimeout(() => doSlice(axis, p), 100);
     },
-    [axis, handleSlice]
+    [axis, doSlice]
   );
 
-  // ── CFD run handler ─────────────────────────────────────────
+  // ── CFD run handler (worker-based, no API) ─────────────────
   const handleRunCfd = useCallback(
-    async (params: {
+    (params: {
       flowDirection: FlowDirection;
       reynolds: number;
       gridNx: number;
@@ -108,47 +112,48 @@ export default function Home() {
     }) => {
       if (!sliceResult?.polygons.length) return;
 
-      setCfdRunning(true);
-      setCfdError(null);
       setStep("simulating");
+      setCfdDomain([0, 4, 0, 2]); // approximate
 
-      try {
-        const result = await runSimulation({
+      run(
+        {
           polygons: sliceResult.polygons,
-          flow_direction: params.flowDirection,
+          flowDirection: params.flowDirection,
           reynolds: params.reynolds,
-          grid_nx: params.gridNx,
-          grid_ny: params.gridNy,
-          t_end: params.tEnd,
-          n_frames: params.nFrames,
-        });
-        setCfdResult(result);
-        setStep("done");
-      } catch (e: any) {
-        setCfdError(e.message || "Simulation failed");
-        setStep("configure");
-      } finally {
-        setCfdRunning(false);
-      }
+          gridNx: params.gridNx,
+          gridNy: params.gridNy,
+          tEnd: params.tEnd,
+          nFrames: params.nFrames,
+        },
+        () => {} // progress handled in hook
+      );
     },
-    [sliceResult]
+    [sliceResult, run]
   );
 
-  // ── range for current axis ──────────────────────────────────
-  const range: [number, number] = bounds
+  // monitor worker completion
+  useEffect(() => {
+    if (!cfdRunning && frames.length > 0 && step === "simulating") {
+      setResultFrames(frames);
+      setStep("done");
+    }
+  }, [cfdRunning, frames, step]);
+
+  // ── range ───────────────────────────────────────────────────
+  const range: [number, number] = modelBounds
     ? (() => {
         const idx = { x: 0, y: 1, z: 2 }[axis];
-        return [bounds.bounds[0][idx], bounds.bounds[1][idx]] as [number, number];
+        return [modelBounds.min.getComponent(idx), modelBounds.max.getComponent(idx)] as [number, number];
       })()
     : [0, 1];
 
-  // ── step indicator ──────────────────────────────────────────
-  const steps: { id: AppStep; label: string }[] = [
-    { id: "upload", label: "Upload STL" },
-    { id: "slice", label: "Slice Model" },
-    { id: "configure", label: "Run CFD" },
-    { id: "simulating", label: "Running..." },
-    { id: "done", label: "Results" },
+  // ── steps ───────────────────────────────────────────────────
+  const steps = [
+    { id: "upload" as const, label: "Upload STL" },
+    { id: "slice" as const, label: "Slice Model" },
+    { id: "configure" as const, label: "Run CFD" },
+    { id: "simulating" as const, label: "Running..." },
+    { id: "done" as const, label: "Results" },
   ];
   const stepIndex = steps.findIndex((s) => s.id === step);
   const progressPct = ((stepIndex + 1) / steps.length) * 100;
@@ -157,26 +162,18 @@ export default function Home() {
     <div className="flex h-screen">
       {/* ── LEFT PANEL ──────────────────────────────────────── */}
       <div className="w-[420px] min-w-[420px] bg-zinc-900 border-r border-zinc-800 flex flex-col overflow-y-auto">
-        {/* header */}
         <div className="p-5 pb-3">
           <h1 className="text-lg font-bold text-violet-400 flex items-center gap-2">
             🌊 CFD from STL
           </h1>
-          <p className="text-xs text-zinc-500 mt-0.5">
-            Upload • Slice • Simulate
-          </p>
+          <p className="text-xs text-zinc-500 mt-0.5">Upload • Slice • Simulate — all in browser</p>
         </div>
 
         <div className="px-5 pb-2">
           <Progress value={progressPct} className="h-1" />
           <div className="flex justify-between mt-1.5">
             {steps.map((s, i) => (
-              <span
-                key={s.id}
-                className={`text-[10px] ${
-                  i <= stepIndex ? "text-violet-400" : "text-zinc-600"
-                }`}
-              >
+              <span key={s.id} className={`text-[10px] ${i <= stepIndex ? "text-violet-400" : "text-zinc-600"}`}>
                 {s.label}
               </span>
             ))}
@@ -185,68 +182,54 @@ export default function Home() {
 
         <Separator className="bg-zinc-800" />
 
-        {/* scrollable content */}
         <div className="flex-1 p-5 space-y-5 overflow-y-auto">
           {/* Step 1: Upload */}
           <div>
-            <h2 className="text-sm font-semibold text-zinc-300 mb-3">
-              📤 1. Upload STL
-            </h2>
+            <h2 className="text-sm font-semibold text-zinc-300 mb-3">📤 1. Upload STL</h2>
             <FileUpload onUpload={handleUpload} disabled={step !== "upload"} />
-            {bounds && (
-              <p className="text-xs text-zinc-500 mt-2">
-                Loaded —{" "}
-                {bounds.extent.map((v) => v.toFixed(1)).join(" × ")} mm
-              </p>
+            {modelBounds && (
+              <p className="text-xs text-zinc-500 mt-2">Loaded ✓</p>
             )}
           </div>
 
-          {/* Step 2: Slice — visible after upload */}
+          {/* Step 2: Slice */}
           <AnimatePresence>
             {step !== "upload" && (
               <motion.div
-                initial={{ opacity: 0, height: 0 }}
-                animate={{ opacity: 1, height: "auto" }}
-                exit={{ opacity: 0, height: 0 }}
-                className="overflow-hidden"
+                initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }}
+                exit={{ opacity: 0, height: 0 }} className="overflow-hidden"
               >
                 <Separator className="bg-zinc-800 mb-4" />
-                <h2 className="text-sm font-semibold text-zinc-300 mb-3">
-                  ✂️ 2. Slice the Model
-                </h2>
+                <h2 className="text-sm font-semibold text-zinc-300 mb-3">✂️ 2. Slice the Model</h2>
                 <SliceControls
-                  axis={axis}
-                  onAxisChange={handleAxisChange}
-                  position={position}
-                  onPositionChange={handlePositionChange}
-                  range={range}
-                  sliceResult={sliceResult}
-                  loading={sliceLoading}
+                  axis={axis} onAxisChange={handleAxisChange}
+                  position={position} onPositionChange={handlePositionChange}
+                  range={range} sliceResult={sliceResult} loading={sliceLoading}
                 />
               </motion.div>
             )}
           </AnimatePresence>
 
-          {/* Step 3: CFD Config — visible after slicing */}
+          {/* Step 3: CFD Config */}
           <AnimatePresence>
             {sliceResult && sliceResult.polygons.length > 0 && (
               <motion.div
-                initial={{ opacity: 0, height: 0 }}
-                animate={{ opacity: 1, height: "auto" }}
-                exit={{ opacity: 0, height: 0 }}
-                className="overflow-hidden"
+                initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }}
+                exit={{ opacity: 0, height: 0 }} className="overflow-hidden"
               >
                 <Separator className="bg-zinc-800 mb-4" />
-                <h2 className="text-sm font-semibold text-zinc-300 mb-3">
-                  🌊 3. Run CFD Simulation
-                </h2>
-                <CfdConfig
-                  onRun={handleRunCfd}
-                  running={cfdRunning}
-                  disabled={!sliceResult?.polygons.length}
-                />
-                {cfdError && (
-                  <p className="text-red-400 text-sm mt-2">{cfdError}</p>
+                <h2 className="text-sm font-semibold text-zinc-300 mb-3">🌊 3. Run CFD (in-browser)</h2>
+                <CfdConfig onRun={handleRunCfd} running={cfdRunning}
+                           disabled={!sliceResult?.polygons.length} />
+                {cfdError && <p className="text-red-400 text-sm mt-2">{cfdError}</p>}
+                {cfdRunning && (
+                  <div className="mt-3 space-y-1">
+                    <Progress value={progress} className="h-2" />
+                    <p className="text-xs text-violet-400 text-center">
+                      <Loader2 className="w-3 h-3 inline animate-spin mr-1" />
+                      Simulating... {progress}%
+                    </p>
+                  </div>
                 )}
               </motion.div>
             )}
@@ -254,16 +237,17 @@ export default function Home() {
 
           {/* Step 4: Results */}
           <AnimatePresence>
-            {cfdResult && (
-              <motion.div
-                initial={{ opacity: 0, y: 20 }}
-                animate={{ opacity: 1, y: 0 }}
-              >
+            {resultFrames.length > 0 && (
+              <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }}>
                 <Separator className="bg-zinc-800 mb-4" />
-                <h2 className="text-sm font-semibold text-zinc-300 mb-3">
-                  ✅ Results
-                </h2>
-                <ResultsView result={cfdResult} />
+                <h2 className="text-sm font-semibold text-zinc-300 mb-3">✅ Results</h2>
+                <CfdResults frames={resultFrames} domain={cfdDomain} />
+                <button
+                  onClick={() => { setStep("upload"); setResultFrames([]); }}
+                  className="mt-3 w-full py-2 rounded-lg bg-zinc-800 text-zinc-400 text-sm hover:bg-zinc-700 transition-colors"
+                >
+                  Start New Simulation
+                </button>
               </motion.div>
             )}
           </AnimatePresence>
@@ -277,9 +261,11 @@ export default function Home() {
           sliceAxis={axis}
           slicePosition={position}
           showPlane={step !== "upload"}
+          onBoundsReady={handleBoundsReady}
+          onGeometryReady={handleGeometryReady}
         />
         <p className="text-[11px] text-zinc-600 mt-2 text-center">
-          🖱 drag=rotate · scroll=zoom · right-drag=pan · X/Y/Z to slice
+          🖱 drag=rotate · scroll=zoom · right-drag=pan
         </p>
       </div>
     </div>
