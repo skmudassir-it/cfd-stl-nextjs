@@ -5,16 +5,28 @@ import { useSolverWorker } from "@/lib/useSolverWorker";
 import { generateMask, type ShapeKind } from "@/lib/shapes";
 import type { SolverFrame } from "@/lib/solver";
 
-// ── viridis colormap ──────────────────────────────────────────
-function viridis(t: number): [number, number, number] {
+// ── magma colormap (bright, high-contrast) ──────────────────
+// Dark background → bright yellow/white at high values
+function magma(t: number): [number, number, number] {
   t = Math.max(0, Math.min(1, t));
-  const r = t < 0.5 ? 0.267004 + t * 2 * 0.015619 : 0.282623 + (t - 0.5) * 2 * 0.710625;
-  const g =
-    t < 0.25 ? 0.004874 + t * 4 * 0.526706 :
-    t < 0.5  ? 0.531580 + (t - 0.25) * 4 * 0.220304 :
-    t < 0.75 ? 0.751884 + (t - 0.50) * 4 * 0.188131 :
-               0.940015 + (t - 0.75) * 4 * -0.066866;
-  const b = t < 0.5 ? 0.329415 + t * 2 * -0.201847 : 0.127568 + (t - 0.5) * 2 * 0.245981;
+  // piecewise cubic approximation of matplotlib magma
+  const r = t < 0.5
+    ? 0.001462 + t * 2 * (0.733068 - 0.001462)
+    : 0.733068 + (t - 0.5) * 2 * (0.987053 - 0.733068);
+  const g = t < 0.25
+    ? 0.000466 + t * 4 * (0.327754 - 0.000466)
+    : t < 0.5
+      ? 0.327754 + (t - 0.25) * 4 * (0.561235 - 0.327754)
+      : t < 0.75
+        ? 0.561235 + (t - 0.5) * 4 * (0.849142 - 0.561235)
+        : 0.849142 + (t - 0.75) * 4 * (0.995737 - 0.849142);
+  const b = t < 0.25
+    ? 0.013866 + t * 4 * (0.174267 - 0.013866)
+    : t < 0.5
+      ? 0.174267 + (t - 0.25) * 4 * (0.350492 - 0.174267)
+      : t < 0.75
+        ? 0.350492 + (t - 0.5) * 4 * (0.527159 - 0.350492)
+        : 0.527159 + (t - 0.75) * 4 * (0.247276 - 0.527159);
   return [r, g, b];
 }
 
@@ -43,10 +55,11 @@ function renderFrame(
       const k = Math.min(gj * nx + gi, data.length - 1);
       const i4 = (py * w + px) * 4;
       if (solidMask[k]) {
-        img.data[i4] = 20; img.data[i4+1] = 20; img.data[i4+2] = 30; img.data[i4+3] = 255;
+        // visible light gray obstacle with subtle edge
+        img.data[i4] = 200; img.data[i4+1] = 195; img.data[i4+2] = 210; img.data[i4+3] = 255;
       } else {
         const t = isFinite(data[k]) ? (data[k] - vMin) / vRange : 0.5;
-        const [cr, cg, cb] = viridis(t);
+        const [cr, cg, cb] = magma(t);
         img.data[i4] = Math.floor(cr * 255);
         img.data[i4+1] = Math.floor(cg * 255);
         img.data[i4+2] = Math.floor(cb * 255);
