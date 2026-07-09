@@ -36,6 +36,10 @@ export default function Home() {
   const [cfdDomain, setCfdDomain] = useState<[number, number, number, number]>([0, 1, 0, 1]);
 
   const sliceTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const geometryRef = useRef<THREE.BufferGeometry | null>(null);
+
+  // keep a ref copy so callbacks can access geometry immediately
+  useEffect(() => { geometryRef.current = geometry; }, [geometry]);
 
   // ── upload handler ──────────────────────────────────────────
   const handleUpload = useCallback(async (file: File) => {
@@ -77,6 +81,15 @@ export default function Home() {
     },
     [geometry]
   );
+
+  // auto-trigger slice when both geometry and bounds are ready
+  useEffect(() => {
+    if (geometryRef.current && modelBounds && step === "slice" && !sliceResult) {
+      const idx = { x: 0, y: 1, z: 2 }[axis];
+      const mid = (modelBounds.min.getComponent(idx) + modelBounds.max.getComponent(idx)) / 2;
+      doSlice(axis, mid);
+    }
+  }, [geometry, modelBounds, step, axis, doSlice, sliceResult]);
 
   const handleAxisChange = useCallback(
     (a: PlaneAxis) => {
@@ -207,6 +220,17 @@ export default function Home() {
                   position={position} onPositionChange={handlePositionChange}
                   range={range} sliceResult={sliceResult} loading={sliceLoading}
                 />
+
+                {/* 2D cross-section — under the slider */}
+                {sliceResult && (
+                  <div className="mt-4">
+                    <Slice2DView
+                      polygons={sliceResult.polygons}
+                      axis={axis}
+                      position={position}
+                    />
+                  </div>
+                )}
               </motion.div>
             )}
           </AnimatePresence>
@@ -255,32 +279,17 @@ export default function Home() {
         </div>
       </div>
 
-      {/* ── RIGHT: 3D VIEWER + 2D SECTION ──────────────────── */}
-      <div className="flex-1 flex flex-col p-4 gap-4 bg-zinc-950">
-        {/* Top: 3D model */}
-        <div className="flex-1 min-h-0">
-          <StlViewer
-            stlUrl={stlUrl}
-            sliceAxis={axis}
-            slicePosition={position}
-            showPlane={step !== "upload"}
-            onBoundsReady={handleBoundsReady}
-            onGeometryReady={handleGeometryReady}
-          />
-        </div>
-
-        {/* Bottom: 2D cross-section */}
-        {sliceResult && step !== "upload" && (
-          <div className="h-[280px] shrink-0">
-            <Slice2DView
-              polygons={sliceResult.polygons}
-              axis={axis}
-              position={position}
-            />
-          </div>
-        )}
-
-        <p className="text-[11px] text-zinc-600 text-center shrink-0">
+      {/* ── RIGHT: 3D VIEWER ─────────────────────────────────── */}
+      <div className="flex-1 p-4 bg-zinc-950">
+        <StlViewer
+          stlUrl={stlUrl}
+          sliceAxis={axis}
+          slicePosition={position}
+          showPlane={step !== "upload"}
+          onBoundsReady={handleBoundsReady}
+          onGeometryReady={handleGeometryReady}
+        />
+        <p className="text-[11px] text-zinc-600 mt-2 text-center">
           🖱 drag=rotate · scroll=zoom · right-drag=pan
         </p>
       </div>
