@@ -1,17 +1,16 @@
 /**
  * Incompressible Navier-Stokes — Chorin projection method
- * Flow past a circular cylinder. Pure TS, no DOM → Web Worker safe.
+ * Flow past arbitrary obstacle shapes. Pure TS, no DOM → Web Worker safe.
  */
 
 export interface SolverInput {
   reynolds: number;
+  charLength: number;     // characteristic length for Re (diameter, side, etc.)
+  solidMask: Uint8Array;  // pre-computed solid mask (1 = obstacle, 0 = fluid)
   gridNx: number;
   gridNy: number;
   domainLx: number;
   domainLy: number;
-  cylinderX: number;
-  cylinderY: number;
-  cylinderD: number;
   tEnd: number;
   nFrames: number;
 }
@@ -29,11 +28,11 @@ export interface SolverFrame {
 export type ProgressCallback = (frame: SolverFrame) => void;
 
 export function runSolver(input: SolverInput, onFrame?: ProgressCallback): SolverFrame[] {
-  const { reynolds, gridNx, gridNy, domainLx, domainLy, cylinderX, cylinderY, cylinderD, tEnd, nFrames } = input;
+  const { reynolds, charLength, solidMask, gridNx, gridNy, domainLx, domainLy, tEnd, nFrames } = input;
   const nx = gridNx, ny = gridNy;
   const dx = domainLx / (nx - 1), dy = domainLy / (ny - 1);
   const uInf = 1.0;
-  const nu = (uInf * cylinderD) / reynolds;
+  const nu = (uInf * charLength) / reynolds;
   const rho = 1.0;
 
   let dt = 0.25 * Math.min(dx, dy) / uInf;
@@ -44,13 +43,8 @@ export function runSolver(input: SolverInput, onFrame?: ProgressCallback): Solve
   const size = ny * nx;
   const idx = (j: number, i: number) => j * nx + i;
 
-  // solid mask (cylinder)
-  const R = cylinderD / 2;
-  const solid = new Uint8Array(size);
-  for (let j = 0; j < ny; j++)
-    for (let i = 0; i < nx; i++)
-      if (Math.sqrt((i * dx - cylinderX) ** 2 + (j * dy - cylinderY) ** 2) <= R)
-        solid[idx(j, i)] = 1;
+  // use the pre-computed solid mask
+  const solid = solidMask;
 
   // fields
   let u = new Float64Array(size), v = new Float64Array(size), p = new Float64Array(size);
