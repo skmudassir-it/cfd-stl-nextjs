@@ -9,6 +9,7 @@ import * as THREE from "three";
 
 import FileUpload from "@/components/FileUpload";
 import StlViewer from "@/components/StlViewer";
+import Slice2DView from "@/components/Slice2DView";
 import SliceControls from "@/components/SliceControls";
 import CfdConfig from "@/components/CfdConfig";
 import CfdResults from "@/components/CfdResults";
@@ -254,17 +255,32 @@ export default function Home() {
         </div>
       </div>
 
-      {/* ── RIGHT: 3D VIEWER ─────────────────────────────────── */}
-      <div className="flex-1 p-4 bg-zinc-950">
-        <StlViewer
-          stlUrl={stlUrl}
-          sliceAxis={axis}
-          slicePosition={position}
-          showPlane={step !== "upload"}
-          onBoundsReady={handleBoundsReady}
-          onGeometryReady={handleGeometryReady}
-        />
-        <p className="text-[11px] text-zinc-600 mt-2 text-center">
+      {/* ── RIGHT: 3D VIEWER + 2D SECTION ──────────────────── */}
+      <div className="flex-1 flex flex-col p-4 gap-4 bg-zinc-950">
+        {/* Top: 3D model */}
+        <div className="flex-1 min-h-0">
+          <StlViewer
+            stlUrl={stlUrl}
+            sliceAxis={axis}
+            slicePosition={position}
+            showPlane={step !== "upload"}
+            onBoundsReady={handleBoundsReady}
+            onGeometryReady={handleGeometryReady}
+          />
+        </div>
+
+        {/* Bottom: 2D cross-section */}
+        {sliceResult && step !== "upload" && (
+          <div className="h-[280px] shrink-0">
+            <Slice2DView
+              polygons={sliceResult.polygons}
+              axis={axis}
+              position={position}
+            />
+          </div>
+        )}
+
+        <p className="text-[11px] text-zinc-600 text-center shrink-0">
           🖱 drag=rotate · scroll=zoom · right-drag=pan
         </p>
       </div>
