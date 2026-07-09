@@ -1,5 +1,6 @@
-// API client for the Python Flask CFD backend
-// Set NEXT_PUBLIC_API_URL to the Flask server URL (default: localhost:5050)
+// API client — uses Next.js rewrites so calls work from same origin.
+// Local dev: /api/upload → http://localhost:5050/upload (via next.config.ts rewrite)
+// Deployed: NEXT_PUBLIC_API_URL must point to a public Flask backend.
 
 import type {
   StlBounds,
@@ -9,13 +10,13 @@ import type {
   PlaneAxis,
 } from "./types";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5050";
+const API = ""; // relative — uses Next.js rewrites
 
 async function apiFetch<T>(
   path: string,
   options?: RequestInit
 ): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
+  const res = await fetch(`${API}${path}`, {
     ...options,
     headers: {
       ...(options?.body instanceof FormData
@@ -34,7 +35,7 @@ async function apiFetch<T>(
 export async function uploadStl(file: File): Promise<StlBounds> {
   const formData = new FormData();
   formData.append("file", file);
-  return apiFetch<StlBounds>("/upload", {
+  return apiFetch<StlBounds>("/api/upload", {
     method: "POST",
     body: formData,
   });
@@ -45,7 +46,7 @@ export async function sliceMesh(
   axis: PlaneAxis,
   position: number
 ): Promise<SliceResult> {
-  return apiFetch<SliceResult>("/slice", {
+  return apiFetch<SliceResult>("/api/slice", {
     method: "POST",
     body: JSON.stringify({
       session_id: sessionId,
@@ -58,7 +59,7 @@ export async function sliceMesh(
 export async function runSimulation(
   params: CfdParams
 ): Promise<CfdResult> {
-  return apiFetch<CfdResult>("/simulate", {
+  return apiFetch<CfdResult>("/api/simulate", {
     method: "POST",
     body: JSON.stringify(params),
   });
@@ -66,5 +67,7 @@ export async function runSimulation(
 
 export function resultUrl(relative: string): string {
   if (relative.startsWith("http")) return relative;
-  return `${API_BASE}${relative}`;
+  // strip /api prefix for static files
+  const path = relative.replace("/api", "");
+  return path;
 }
