@@ -1,297 +1,310 @@
 "use client";
 
-import { useState, useCallback, useRef, useEffect } from "react";
-import { motion, AnimatePresence } from "framer-motion";
-import { Separator } from "@/components/ui/separator";
-import { Progress } from "@/components/ui/progress";
-import { Play, Loader2 } from "lucide-react";
-import * as THREE from "three";
+import { useState, useRef, useEffect, useCallback } from "react";
+import { useSolverWorker } from "@/lib/useSolverWorker";
+import type { SolverFrame } from "@/lib/solver";
 
-import FileUpload from "@/components/FileUpload";
-import StlViewer from "@/components/StlViewer";
-import Slice2DView from "@/components/Slice2DView";
-import SliceControls from "@/components/SliceControls";
-import CfdConfig from "@/components/CfdConfig";
-import CfdResults from "@/components/CfdResults";
+// ── viridis colormap (piecewise linear, 256 stops) ──────────────
+function viridis(t: number): [number, number, number] {
+  t = Math.max(0, Math.min(1, t));
+  const r = t < 0.5
+    ? 0.267004 + t * 2 * (0.282623 - 0.267004)
+    : 0.282623 + (t - 0.5) * 2 * (0.993248 - 0.282623);
+  const g = t < 0.25
+    ? 0.004874 + t * 4 * (0.531580 - 0.004874)
+    : t < 0.5
+      ? 0.531580 + (t - 0.25) * 4 * (0.751884 - 0.531580)
+      : t < 0.75
+        ? 0.751884 + (t - 0.5) * 4 * (0.940015 - 0.751884)
+        : 0.940015 + (t - 0.75) * 4 * (0.873149 - 0.940015);
+  const b = t < 0.5
+    ? 0.329415 + t * 2 * (0.127568 - 0.329415)
+    : 0.127568 + (t - 0.5) * 2 * (0.373549 - 0.127568);
+  return [r, g, b];
+}
 
-import { sliceGeometry } from "@/lib/stl-slicer";
-import { useCfdWorker } from "@/lib/useCfdWorker";
-import type { SliceResult, PlaneAxis, FlowDirection, AppStep } from "@/lib/types";
+// ── render a solver frame to canvas ─────────────────────────────
+function renderFrame(
+  ctx: CanvasRenderingContext2D,
+  frame: SolverFrame,
+  field: "vorticity" | "speed",
+  w: number, h: number
+) {
+  const { nx, ny, solidMask } = frame;
+  const data = field === "vorticity" ? frame.vorticity : frame.speed;
+
+  // compute value range (skip NaN in solids)
+  let vMin = Infinity, vMax = -Infinity;
+  for (let i = 0; i < data.length; i++) {
+    if (solidMask[i]) continue;
+    if (data[i] < vMin) vMin = data[i];
+    if (data[i] > vMax) vMax = data[i];
+  }
+  if (!isFinite(vMin)) { vMin = -1; vMax = 1; }
+  const vRange = vMax - vMin || 1;
+
+  const img = ctx.createImageData(w, h);
+  for (let py = 0; py < h; py++) {
+    for (let px = 0; px < w; px++) {
+      // map pixel → grid index (flip y for image coords)
+      const gi = Math.floor((px / w) * nx);
+      const gj = Math.floor(((h - 1 - py) / h) * ny);
+      const k = Math.min(gj * nx + gi, data.length - 1);
+      const idx4 = (py * w + px) * 4;
+
+      if (solidMask[k]) {
+        img.data[idx4] = 20; img.data[idx4 + 1] = 20; img.data[idx4 + 2] = 30; img.data[idx4 + 3] = 255;
+      } else {
+        const val = data[k];
+        const t = isFinite(val) ? (val - vMin) / vRange : 0.5;
+        const [r, g, b] = viridis(t);
+        img.data[idx4]     = Math.floor(r * 255);
+        img.data[idx4 + 1] = Math.floor(g * 255);
+        img.data[idx4 + 2] = Math.floor(b * 255);
+        img.data[idx4 + 3] = 255;
+      }
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+}
+
+// ── defaults ────────────────────────────────────────────────────
+const DEFAULTS = {
+  reynolds: 100,
+  gridNx: 200,
+  gridNy: 100,
+  domainLx: 4.0,
+  domainLy: 2.0,
+  cylinderX: 1.0,
+  cylinderY: 1.0,
+  cylinderD: 0.2,
+  tEnd: 5.0,
+  nFrames: 60,
+};
 
 export default function Home() {
-  const [step, setStep] = useState<AppStep>("upload");
-  const [stlUrl, setStlUrl] = useState<string | null>(null);
-  const [geometry, setGeometry] = useState<THREE.BufferGeometry | null>(null);
-  const [modelBounds, setModelBounds] = useState<{ min: THREE.Vector3; max: THREE.Vector3 } | null>(null);
-  const [resultFrames, setResultFrames] = useState<typeof frames>([]);
+  const { running, frames, progress, error, run, cancel } = useSolverWorker();
+  const [reynolds, setReynolds] = useState(DEFAULTS.reynolds);
+  const [field, setField] = useState<"vorticity" | "speed">("vorticity");
+  const [playing, setPlaying] = useState(false);
+  const [frameIdx, setFrameIdx] = useState(0);
+  const [recording, setRecording] = useState(false);
 
-  // slice state
-  const [axis, setAxis] = useState<PlaneAxis>("z");
-  const [position, setPosition] = useState(0);
-  const [sliceResult, setSliceResult] = useState<SliceResult | null>(null);
-  const [sliceLoading, setSliceLoading] = useState(false);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const animRef = useRef<number>(0);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+  const streamRef = useRef<MediaStream | null>(null);
 
-  // cfd state
-  const { frames, running: cfdRunning, progress, error: cfdError, run, cancel } = useCfdWorker();
-  const [cfdDomain, setCfdDomain] = useState<[number, number, number, number]>([0, 1, 0, 1]);
-
-  const sliceTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const geometryRef = useRef<THREE.BufferGeometry | null>(null);
-
-  // keep a ref copy so callbacks can access geometry immediately
-  useEffect(() => { geometryRef.current = geometry; }, [geometry]);
-
-  // ── upload handler ──────────────────────────────────────────
-  const handleUpload = useCallback(async (file: File) => {
-    setStlUrl(URL.createObjectURL(file));
-    // geometry + bounds come via callbacks from StlViewer
-  }, []);
-
-  const handleBoundsReady = useCallback((box: THREE.Box3) => {
-    setModelBounds({ min: box.min, max: box.max });
-    setStep("slice");
-    // auto-slice at z-center
-    const midZ = (box.min.z + box.max.z) / 2;
-    setPosition(midZ);
-  }, []);
-
-  const handleGeometryReady = useCallback((geo: THREE.BufferGeometry) => {
-    setGeometry(geo);
-  }, []);
-
-  // ── slice handler (client-side, no API) ─────────────────────
-  const doSlice = useCallback(
-    (a: PlaneAxis, pos: number) => {
-      if (!geometry) return;
-      setSliceLoading(true);
-      try {
-        const result = sliceGeometry(geometry, a, pos);
-        setSliceResult({
-          axis: result.axis,
-          position: result.position,
-          polygons: result.polygons,
-          num_polygons: result.polygons.length,
-          bounds_range: [0, 0], // not used
-        });
-      } catch {
-        // silently fail
-      } finally {
-        setSliceLoading(false);
-      }
-    },
-    [geometry]
-  );
-
-  // auto-trigger slice when both geometry and bounds are ready
+  // render current frame
   useEffect(() => {
-    if (geometryRef.current && modelBounds && step === "slice" && !sliceResult) {
-      const idx = { x: 0, y: 1, z: 2 }[axis];
-      const mid = (modelBounds.min.getComponent(idx) + modelBounds.max.getComponent(idx)) / 2;
-      doSlice(axis, mid);
-    }
-  }, [geometry, modelBounds, step, axis, doSlice, sliceResult]);
+    const canvas = canvasRef.current;
+    if (!canvas || frames.length === 0) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    renderFrame(ctx, frames[Math.min(frameIdx, frames.length - 1)], field, canvas.width, canvas.height);
+  }, [frames, frameIdx, field]);
 
-  const handleAxisChange = useCallback(
-    (a: PlaneAxis) => {
-      setAxis(a);
-      if (modelBounds) {
-        const idx = { x: 0, y: 1, z: 2 };
-        const ax = a as "x" | "y" | "z";
-        const mid = (modelBounds.min.getComponent(idx[ax]) + modelBounds.max.getComponent(idx[ax])) / 2;
-        setPosition(mid);
-        doSlice(a, mid);
-      }
-    },
-    [modelBounds, doSlice]
-  );
-
-  const handlePositionChange = useCallback(
-    (p: number) => {
-      setPosition(p);
-      if (sliceTimeoutRef.current) clearTimeout(sliceTimeoutRef.current);
-      sliceTimeoutRef.current = setTimeout(() => doSlice(axis, p), 100);
-    },
-    [axis, doSlice]
-  );
-
-  // ── CFD run handler (worker-based, no API) ─────────────────
-  const handleRunCfd = useCallback(
-    (params: {
-      flowDirection: FlowDirection;
-      reynolds: number;
-      gridNx: number;
-      gridNy: number;
-      tEnd: number;
-      nFrames: number;
-    }) => {
-      if (!sliceResult?.polygons.length) return;
-
-      setStep("simulating");
-      setCfdDomain([0, 4, 0, 2]); // approximate
-
-      run(
-        {
-          polygons: sliceResult.polygons,
-          flowDirection: params.flowDirection,
-          reynolds: params.reynolds,
-          gridNx: params.gridNx,
-          gridNy: params.gridNy,
-          tEnd: params.tEnd,
-          nFrames: params.nFrames,
-        },
-        () => {} // progress handled in hook
-      );
-    },
-    [sliceResult, run]
-  );
-
-  // monitor worker completion
+  // animation loop
   useEffect(() => {
-    if (!cfdRunning && frames.length > 0 && step === "simulating") {
-      setResultFrames(frames);
-      setStep("done");
-    }
-  }, [cfdRunning, frames, step]);
+    if (!playing || frames.length === 0) return;
+    let idx = frameIdx;
+    const loop = () => {
+      idx = (idx + 1) % frames.length;
+      setFrameIdx(idx);
+      animRef.current = requestAnimationFrame(loop);
+    };
+    animRef.current = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(animRef.current);
+  }, [playing, frames.length]);
 
-  // ── range ───────────────────────────────────────────────────
-  const range: [number, number] = modelBounds
-    ? (() => {
-        const idx = { x: 0, y: 1, z: 2 }[axis];
-        return [modelBounds.min.getComponent(idx), modelBounds.max.getComponent(idx)] as [number, number];
-      })()
-    : [0, 1];
+  // auto-play when simulation finishes
+  useEffect(() => {
+    if (!running && frames.length > 0 && !playing) setPlaying(true);
+  }, [running, frames.length, playing]);
 
-  // ── steps ───────────────────────────────────────────────────
-  const steps = [
-    { id: "upload" as const, label: "Upload STL" },
-    { id: "slice" as const, label: "Slice Model" },
-    { id: "configure" as const, label: "Run CFD" },
-    { id: "simulating" as const, label: "Running..." },
-    { id: "done" as const, label: "Results" },
-  ];
-  const stepIndex = steps.findIndex((s) => s.id === step);
-  const progressPct = ((stepIndex + 1) / steps.length) * 100;
+  const handleRun = useCallback(() => {
+    setPlaying(false);
+    setFrameIdx(0);
+    run({ ...DEFAULTS, reynolds, gridNx: 300, gridNy: 150 });
+  }, [reynolds, run]);
+
+  // ── video export via MediaRecorder ─────────────────────────
+  const startExport = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || frames.length === 0) return;
+
+    const stream = canvas.captureStream(30);
+    streamRef.current = stream;
+
+    const recorder = new MediaRecorder(stream, { mimeType: "video/webm;codecs=vp9" });
+    mediaRecorderRef.current = recorder;
+    chunksRef.current = [];
+
+    recorder.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data); };
+    recorder.onstop = () => {
+      const blob = new Blob(chunksRef.current, { type: "video/webm" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `flow-re${reynolds}-${field}.webm`;
+      a.click();
+      URL.revokeObjectURL(url);
+      setRecording(false);
+      stream.getTracks().forEach(t => t.stop());
+    };
+
+    setRecording(true);
+    recorder.start();
+
+    // render each frame to canvas while recording
+    let i = 0;
+    const ctx = canvas.getContext("2d")!;
+    const renderNext = () => {
+      if (i >= frames.length) { recorder.stop(); return; }
+      renderFrame(ctx, frames[i], field, canvas.width, canvas.height);
+      i++;
+      setTimeout(renderNext, 1000 / 30);
+    };
+    renderNext();
+  }, [frames, field, reynolds]);
+
+  const cancelExport = useCallback(() => {
+    mediaRecorderRef.current?.stop();
+  }, []);
 
   return (
-    <div className="flex h-screen">
-      {/* ── LEFT PANEL ──────────────────────────────────────── */}
-      <div className="w-[420px] min-w-[420px] bg-zinc-900 border-r border-zinc-800 flex flex-col overflow-y-auto">
-        <div className="p-5 pb-3">
-          <h1 className="text-lg font-bold text-violet-400 flex items-center gap-2">
-            🌊 CFD from STL
-          </h1>
-          <p className="text-xs text-zinc-500 mt-0.5">Upload • Slice • Simulate — all in browser</p>
+    <div className="min-h-screen bg-zinc-950 text-zinc-200 flex flex-col">
+      {/* header */}
+      <header className="px-6 py-4 border-b border-zinc-800 flex items-center justify-between shrink-0">
+        <div>
+          <h1 className="text-lg font-bold text-violet-400">🌊 Flow Past a Cylinder</h1>
+          <p className="text-xs text-zinc-500">Incompressible Navier-Stokes · Chorin projection · In-browser CFD</p>
+        </div>
+        <div className="flex gap-3 items-center">
+          <span className="text-xs text-zinc-600">Re = {reynolds}</span>
+        </div>
+      </header>
+
+      {/* main */}
+      <div className="flex-1 flex">
+        {/* left: canvas */}
+        <div className="flex-1 p-4 flex items-center justify-center bg-[#0a0a0f]">
+          <canvas
+            ref={canvasRef}
+            width={900}
+            height={450}
+            className="w-full max-w-[900px] rounded-lg border border-zinc-800"
+          />
         </div>
 
-        <div className="px-5 pb-2">
-          <Progress value={progressPct} className="h-1" />
-          <div className="flex justify-between mt-1.5">
-            {steps.map((s, i) => (
-              <span key={s.id} className={`text-[10px] ${i <= stepIndex ? "text-violet-400" : "text-zinc-600"}`}>
-                {s.label}
-              </span>
-            ))}
-          </div>
-        </div>
-
-        <Separator className="bg-zinc-800" />
-
-        <div className="flex-1 p-5 space-y-5 overflow-y-auto">
-          {/* Step 1: Upload */}
+        {/* right: controls */}
+        <div className="w-[360px] min-w-[360px] bg-zinc-900 border-l border-zinc-800 p-5 flex flex-col gap-5 overflow-y-auto">
+          {/* Reynolds */}
           <div>
-            <h2 className="text-sm font-semibold text-zinc-300 mb-3">📤 1. Upload STL</h2>
-            <FileUpload onUpload={handleUpload} disabled={step !== "upload"} />
-            {modelBounds && (
-              <p className="text-xs text-zinc-500 mt-2">Loaded ✓</p>
-            )}
+            <label className="text-sm font-semibold text-zinc-300">Reynolds Number</label>
+            <div className="flex items-center gap-3 mt-2">
+              <input
+                type="range" min={10} max={500} step={5} value={reynolds}
+                onChange={e => setReynolds(Number(e.target.value))}
+                disabled={running}
+                className="flex-1 accent-violet-500"
+              />
+              <span className="text-sm font-mono text-violet-400 w-12 text-right">{reynolds}</span>
+            </div>
+            <div className="flex justify-between text-[10px] text-zinc-600 mt-1">
+              <span>Laminar</span><span>Transitional</span><span>Turbulent</span>
+            </div>
           </div>
 
-          {/* Step 2: Slice */}
-          <AnimatePresence>
-            {step !== "upload" && (
-              <motion.div
-                initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }}
-                exit={{ opacity: 0, height: 0 }} className="overflow-hidden"
-              >
-                <Separator className="bg-zinc-800 mb-4" />
-                <h2 className="text-sm font-semibold text-zinc-300 mb-3">✂️ 2. Slice the Model</h2>
-                <SliceControls
-                  axis={axis} onAxisChange={handleAxisChange}
-                  position={position} onPositionChange={handlePositionChange}
-                  range={range} sliceResult={sliceResult} loading={sliceLoading}
-                />
-
-                {/* 2D cross-section — under the slider */}
-                {sliceResult && (
-                  <div className="mt-4">
-                    <Slice2DView
-                      polygons={sliceResult.polygons}
-                      axis={axis}
-                      position={position}
-                    />
-                  </div>
-                )}
-              </motion.div>
-            )}
-          </AnimatePresence>
-
-          {/* Step 3: CFD Config */}
-          <AnimatePresence>
-            {sliceResult && sliceResult.polygons.length > 0 && (
-              <motion.div
-                initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }}
-                exit={{ opacity: 0, height: 0 }} className="overflow-hidden"
-              >
-                <Separator className="bg-zinc-800 mb-4" />
-                <h2 className="text-sm font-semibold text-zinc-300 mb-3">🌊 3. Run CFD (in-browser)</h2>
-                <CfdConfig onRun={handleRunCfd} running={cfdRunning}
-                           disabled={!sliceResult?.polygons.length} />
-                {cfdError && <p className="text-red-400 text-sm mt-2">{cfdError}</p>}
-                {cfdRunning && (
-                  <div className="mt-3 space-y-1">
-                    <Progress value={progress} className="h-2" />
-                    <p className="text-xs text-violet-400 text-center">
-                      <Loader2 className="w-3 h-3 inline animate-spin mr-1" />
-                      Simulating... {progress}%
-                    </p>
-                  </div>
-                )}
-              </motion.div>
-            )}
-          </AnimatePresence>
-
-          {/* Step 4: Results */}
-          <AnimatePresence>
-            {resultFrames.length > 0 && (
-              <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }}>
-                <Separator className="bg-zinc-800 mb-4" />
-                <h2 className="text-sm font-semibold text-zinc-300 mb-3">✅ Results</h2>
-                <CfdResults frames={resultFrames} domain={cfdDomain} />
-                <button
-                  onClick={() => { setStep("upload"); setResultFrames([]); }}
-                  className="mt-3 w-full py-2 rounded-lg bg-zinc-800 text-zinc-400 text-sm hover:bg-zinc-700 transition-colors"
+          {/* field toggle */}
+          <div>
+            <label className="text-sm font-semibold text-zinc-300">Field</label>
+            <div className="flex gap-2 mt-2">
+              {(["vorticity", "speed"] as const).map(f => (
+                <button key={f}
+                  onClick={() => setField(f)}
+                  disabled={running}
+                  className={`flex-1 py-2 rounded-lg text-sm font-semibold transition-all ${
+                    field === f
+                      ? "bg-violet-600 text-white"
+                      : "bg-zinc-800 text-zinc-400 hover:bg-zinc-700"
+                  }`}
                 >
-                  Start New Simulation
+                  {f === "vorticity" ? "🌀 Vorticity" : "💨 Speed"}
                 </button>
-              </motion.div>
-            )}
-          </AnimatePresence>
-        </div>
-      </div>
+              ))}
+            </div>
+          </div>
 
-      {/* ── RIGHT: 3D VIEWER ─────────────────────────────────── */}
-      <div className="flex-1 p-4 bg-zinc-950">
-        <StlViewer
-          stlUrl={stlUrl}
-          sliceAxis={axis}
-          slicePosition={position}
-          showPlane={step !== "upload"}
-          onBoundsReady={handleBoundsReady}
-          onGeometryReady={handleGeometryReady}
-        />
-        <p className="text-[11px] text-zinc-600 mt-2 text-center">
-          🖱 drag=rotate · scroll=zoom · right-drag=pan
-        </p>
+          {/* run / cancel */}
+          <button
+            onClick={running ? cancel : handleRun}
+            className={`w-full py-3 rounded-lg text-sm font-bold transition-all ${
+              running
+                ? "bg-red-600 hover:bg-red-500 text-white"
+                : "bg-violet-600 hover:bg-violet-500 text-white shadow-lg shadow-violet-600/20"
+            }`}
+          >
+            {running ? "⏹ Cancel" : "▶ Run Simulation"}
+          </button>
+
+          {/* progress */}
+          {running && (
+            <div>
+              <div className="w-full h-2 bg-zinc-800 rounded-full overflow-hidden">
+                <div className="h-full bg-violet-500 transition-all duration-300" style={{ width: `${progress}%` }} />
+              </div>
+              <p className="text-xs text-violet-400 text-center mt-1">Computing... {progress}%</p>
+            </div>
+          )}
+
+          {error && <p className="text-red-400 text-sm bg-red-900/20 p-3 rounded-lg">{error}</p>}
+
+          {/* playback */}
+          {frames.length > 0 && !running && (
+            <>
+              <div className="border-t border-zinc-800 pt-4">
+                <label className="text-sm font-semibold text-zinc-300">Playback</label>
+                <div className="flex gap-2 mt-2">
+                  <button onClick={() => setPlaying(p => !p)}
+                    className="flex-1 py-2 rounded-lg text-sm bg-zinc-800 hover:bg-zinc-700 text-zinc-300">
+                    {playing ? "⏸ Pause" : "▶ Play"}
+                  </button>
+                  <button onClick={() => { setPlaying(false); setFrameIdx(0); }}
+                    className="py-2 px-4 rounded-lg text-sm bg-zinc-800 hover:bg-zinc-700 text-zinc-300">
+                    ⏮
+                  </button>
+                </div>
+                <input type="range" min={0} max={frames.length - 1} value={frameIdx}
+                  onChange={e => { setPlaying(false); setFrameIdx(Number(e.target.value)); }}
+                  className="w-full mt-2 accent-violet-500" />
+                <p className="text-xs text-zinc-500 text-center mt-1">
+                  Frame {frameIdx + 1} / {frames.length}
+                </p>
+              </div>
+
+              {/* export */}
+              <button onClick={recording ? cancelExport : startExport}
+                className={`w-full py-3 rounded-lg text-sm font-bold transition-all ${
+                  recording
+                    ? "bg-amber-600 text-white"
+                    : "bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border border-zinc-700"
+                }`}>
+                {recording ? "⏹ Cancel Export" : "⬇ Export as WebM Video"}
+              </button>
+              {recording && <p className="text-xs text-amber-400 text-center">Recording frames...</p>}
+            </>
+          )}
+
+          {/* info */}
+          <div className="border-t border-zinc-800 pt-4 text-xs text-zinc-600 space-y-1">
+            <p>Grid: 300×150 · Domain: 4.0×2.0</p>
+            <p>Cylinder: D=0.2 at (1.0, 1.0)</p>
+            <p>Method: Chorin projection · Jacobi PP</p>
+            <p>Δt: auto (CFL + diffusive limit)</p>
+          </div>
+        </div>
       </div>
     </div>
   );
