@@ -4,60 +4,80 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import { useSolverWorker } from "@/lib/useSolverWorker";
 import { generateMask, type ShapeKind } from "@/lib/shapes";
 import type { SolverFrame } from "@/lib/solver";
+import type { FlowDir } from "@/lib/solver";
 
-// ── Blue–White–Red diverging colormap (classic CFD) ────────
-// t=0 → blue, t=0.5 → white, t=1 → red
-function coolwarm(t: number): [number, number, number] {
-  t = Math.max(0, Math.min(1, t));
-  if (t < 0.5) {
-    // blue → white: lerp (0,0,1) → (1,1,1)
-    const s = t * 2; // 0..1
-    return [s, s, 1 - s * 0.7];
+// ── dual colormap ────────────────────────────────────────────
+// Diverging blue→white→red for vorticity (t in [-1, 1])
+function diverging(t: number): [number, number, number] {
+  t = Math.max(-1, Math.min(1, t));
+  let r: number, g: number, b: number;
+  if (t < 0) {
+    const a = t + 1;
+    r = 33 + (247 - 33) * a;
+    g = 102 + (247 - 102) * a;
+    b = 172 + (247 - 172) * a;
   } else {
-    // white → red: lerp (1,1,1) → (1,0,0)
-    const s = (t - 0.5) * 2; // 0..1
-    return [1, 1 - s, 1 - s];
+    r = 247 + (178 - 247) * t;
+    g = 247 + (24 - 247) * t;
+    b = 247 + (43 - 247) * t;
   }
+  return [r / 255, g / 255, b / 255];
+}
+// Magma for speed (t in [0, 1])
+function magma(t: number): [number, number, number] {
+  t = Math.max(0, Math.min(1, t));
+  const stops = [[13,8,135],[126,3,168],[204,71,120],[248,149,64],[240,249,33]];
+  const x = t * (stops.length - 1), i = Math.floor(x), f = x - i;
+  const A = stops[i], B = stops[Math.min(i + 1, stops.length - 1)];
+  return [(A[0] + (B[0] - A[0]) * f) / 255, (A[1] + (B[1] - A[1]) * f) / 255, (A[2] + (B[2] - A[2]) * f) / 255];
 }
 
-// ── render frame to canvas ────────────────────────────────────
+// ── render frame to canvas (smooth upscaling) ────────────────
 function renderFrame(
   ctx: CanvasRenderingContext2D, frame: SolverFrame,
-  field: "vorticity" | "speed", w: number, h: number
+  field: "vorticity" | "speed", canvasW: number, canvasH: number
 ) {
   const { nx, ny, solidMask } = frame;
   const data = field === "vorticity" ? frame.vorticity : frame.speed;
+  const isVort = field === "vorticity";
 
+  // range: symmetric for vorticity, 0→max for speed
   let vMin = Infinity, vMax = -Infinity;
   for (let i = 0; i < data.length; i++) {
     if (solidMask[i]) continue;
     if (data[i] < vMin) vMin = data[i];
     if (data[i] > vMax) vMax = data[i];
   }
-  if (!isFinite(vMin)) { vMin = -1; vMax = 1; }
+  if (isVort) { const m = Math.max(Math.abs(vMin), Math.abs(vMax)) || 1; vMin = -m; vMax = m; }
+  else { if (!isFinite(vMin)) { vMin = 0; vMax = 1; } vMin = 0; }
   const vRange = vMax - vMin || 1;
 
-  const img = ctx.createImageData(w, h);
-  for (let py = 0; py < h; py++) {
-    for (let px = 0; px < w; px++) {
-      const gi = Math.floor((px / w) * nx);
-      const gj = Math.floor(((h - 1 - py) / h) * ny);
-      const k = Math.min(gj * nx + gi, data.length - 1);
-      const i4 = (py * w + px) * 4;
+  // render at grid resolution, then upscale
+  const img = new ImageData(nx, ny);
+  for (let j = 0; j < ny; j++) {
+    for (let i = 0; i < nx; i++) {
+      const k = j * nx + i;
+      const o = ((ny - 1 - j) * nx + i) * 4;
       if (solidMask[k]) {
-        // dark obstacle on white background
-        img.data[i4] = 40; img.data[i4+1] = 40; img.data[i4+2] = 40; img.data[i4+3] = 255;
+        img.data[o] = 60; img.data[o + 1] = 60; img.data[o + 2] = 65; img.data[o + 3] = 255;
       } else {
-        const t = isFinite(data[k]) ? (data[k] - vMin) / vRange : 0.5;
-        const [cr, cg, cb] = coolwarm(t);
-        img.data[i4] = Math.floor(cr * 255);
-        img.data[i4+1] = Math.floor(cg * 255);
-        img.data[i4+2] = Math.floor(cb * 255);
-        img.data[i4+3] = 255;
+        const val = data[k];
+        const t = isFinite(val) ? (val - vMin) / vRange : 0.5;
+        const [cr, cg, cb] = isVort ? diverging(t * 2 - 1) : magma(t);
+        img.data[o] = Math.floor(cr * 255);
+        img.data[o + 1] = Math.floor(cg * 255);
+        img.data[o + 2] = Math.floor(cb * 255);
+        img.data[o + 3] = 255;
       }
     }
   }
-  ctx.putImageData(img, 0, 0);
+  // smooth upscale via temp canvas
+  const tmp = document.createElement("canvas");
+  tmp.width = nx; tmp.height = ny;
+  tmp.getContext("2d")!.putImageData(img, 0, 0);
+  ctx.imageSmoothingEnabled = true;
+  ctx.clearRect(0, 0, canvasW, canvasH);
+  ctx.drawImage(tmp, 0, 0, canvasW, canvasH);
 }
 
 // ── shape definitions ─────────────────────────────────────────
@@ -81,6 +101,8 @@ export default function Home() {
   const [shapeAspect, setShapeAspect] = useState(1.5);   // width/height for ellipse/diamond/triangle
   const [shapeX, setShapeX] = useState(1.0);             // center x in domain
   const [field, setField] = useState<"vorticity" | "speed">("vorticity");
+  const [flowDir, setFlowDir] = useState<FlowDir>("+x");
+  const [inflowSpeed, setInflowSpeed] = useState(1.0);
   const [playing, setPlaying] = useState(false);
   const [frameIdx, setFrameIdx] = useState(0);
   const [recording, setRecording] = useState(false);
@@ -123,11 +145,11 @@ export default function Home() {
     });
     // transfer the mask to avoid copying
     run({
-      reynolds, charLength: shapeSize, solidMask: mask,
+      reynolds, inflowSpeed, flowDir, charLength: shapeSize, solidMask: mask,
       gridNx: NX, gridNy: NY, domainLx: LX, domainLy: LY,
       tEnd: 5.0, nFrames: 60,
     });
-  }, [reynolds, shape, shapeSize, shapeAspect, shapeX, run]);
+  }, [reynolds, shape, shapeSize, shapeAspect, shapeX, inflowSpeed, flowDir, run]);
 
   // ── export ────────────────────────────────────────────────
   const startExport = useCallback(() => {
@@ -258,6 +280,28 @@ export default function Home() {
                 {f === "vorticity" ? "🌀 Vorticity" : "💨 Speed"}
               </button>
             ))}
+          </div>
+
+          {/* Flow direction */}
+          <div>
+            <label className="font-semibold text-gray-700">Flow Direction</label>
+            <div className="grid grid-cols-4 gap-1 mt-2">
+              {([["+x","→"],["-x","←"],["+y","↑"],["-y","↓"]] as [FlowDir, string][]).map(([d, icon]) => (
+                <button key={d} onClick={() => setFlowDir(d)} disabled={running}
+                  className={`py-2 rounded-lg text-sm font-bold transition-all ${
+                    flowDir === d ? "bg-violet-600 text-white" : "bg-white text-gray-500 hover:bg-gray-100 border border-gray-200"
+                  }`}>{icon}</button>
+              ))}
+            </div>
+          </div>
+
+          {/* Inflow speed */}
+          <div>
+            <label className="font-semibold text-gray-700">Inflow Speed: {inflowSpeed.toFixed(1)}</label>
+            <input type="range" min={0.1} max={3.0} step={0.1} value={inflowSpeed}
+              onChange={e => setInflowSpeed(Number(e.target.value))}
+              disabled={running}
+              className="w-full mt-1 accent-violet-500" />
           </div>
 
           {/* Run */}
