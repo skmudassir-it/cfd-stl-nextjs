@@ -59,7 +59,7 @@ function renderFrame(
       const k = j * nx + i;
       const o = ((ny - 1 - j) * nx + i) * 4;
       if (solidMask[k]) {
-        img.data[o] = 60; img.data[o + 1] = 60; img.data[o + 2] = 65; img.data[o + 3] = 255;
+        img.data[o] = 0; img.data[o + 1] = 0; img.data[o + 2] = 0; img.data[o + 3] = 255;
       } else {
         const val = data[k];
         const t = isFinite(val) ? (val - vMin) / vRange : 0.5;
